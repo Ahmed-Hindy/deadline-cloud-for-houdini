@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import copy
 import os
+import re
 import sys
 import yaml
 import json
@@ -656,18 +657,39 @@ def _get_job_template(
         if queue_parameter_definitions_json is not None
         else []
     )
-    parameter_definitions.append(
-        {
-            "name": "HipFile",
-            "type": "PATH",
-            "objectType": "FILE",
-            "dataFlow": "IN",
-            "default": _get_hip_file(),
-        }
-    )
     steps: list[dict[str, Any]] = []
-    for node in rop_steps:
-        steps.append(_get_step_template(node, ignore_input_nodes))
+    if _ods_use_husk():
+        # ODS husk-native path: render a pre-exported USD with standalone husk.
+        # No HipFile input (husk never opens the hip). Each render node exports
+        # its thin USD at submit time; declare it as a per-node PATH input so
+        # Deadline Cloud maps X:\ -> /mnt/projects on the worker.
+        for node in rop_steps:
+            usd_path = _ods_export_render_usd(node["rop"])
+            usd_param = "RenderUsdFile_{}".format(
+                re.sub(r"[^A-Za-z0-9_]", "_", node["name"])
+            )
+            parameter_definitions.append(
+                {
+                    "name": usd_param,
+                    "type": "PATH",
+                    "objectType": "FILE",
+                    "dataFlow": "IN",
+                    "default": usd_path,
+                }
+            )
+            steps.append(_ods_get_husk_step_template(node, usd_param))
+    else:
+        parameter_definitions.append(
+            {
+                "name": "HipFile",
+                "type": "PATH",
+                "objectType": "FILE",
+                "dataFlow": "IN",
+                "default": _get_hip_file(),
+            }
+        )
+        for node in rop_steps:
+            steps.append(_get_step_template(node, ignore_input_nodes))
     job_template = {
         "specificationVersion": "jobtemplate-2023-09",
         "name": rop.parm("name").evalAsString(),
@@ -749,6 +771,176 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
         ]
         if not job_template["jobEnvironments"]:
             del job_template["jobEnvironments"]
+
+
+# --- ODS: husk-native render path -------------------------------------------
+# When ODS_HOUDINI_USE_HUSK is set, render usdrender ROPs with standalone husk on
+# a pre-exported USD instead of the houdini-openjd adaptor (which cooks the scene
+# in hython and, for a Driver/usdrender ROP, only exports the USD and never runs
+# husk headless). The USD is exported at submit time (_ods_export_render_usd) and
+# declared as a PATH input so Deadline Cloud maps it onto the worker. husk is on
+# PATH from the Conda queue env's Houdini package. Mirrors the AWS
+# deadline-cloud-samples houdini_husk_usd_render bundle.
+_ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
+
+
+def _ods_use_husk() -> bool:
+    return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
+
+
+def _ods_export_render_usd(rop_path: str) -> str:
+    """Export the usdrender ROP's thin render USD at submit time.
+
+    Calling render() on a Driver/usdrender ROP writes its ``lopoutput`` thin USD
+    layer (which references the scene's existing USD on the share — not a flatten)
+    and, headless, skips the husk stage. That exported layer is exactly what husk
+    needs. Returns the absolute path to the exported ``__render__.usd``.
+    """
+    rop = hou.node(rop_path)
+    if rop is None:
+        raise RuntimeError(f"Cannot find render ROP at path: {rop_path}")
+
+    lopoutput = rop.parm("lopoutput")
+    if lopoutput is None:
+        raise RuntimeError(
+            f"ROP {rop_path} has no 'lopoutput' parm; husk render path needs a "
+            "usdrender ROP."
+        )
+
+    # Resolve the absolute export path the ROP would write to. lopoutput often
+    # evaluates to a bare '__render__.usd'; the ROP writes it under a derived
+    # $HIP/ayon/<rop>/usd/<hipname>/<rop>/ dir. Evaluate via the ROP so the real
+    # target is captured, then make it absolute against $HIP when relative.
+    out_path = lopoutput.eval()
+    if not os.path.isabs(out_path):
+        # Reproduce the ROP's derived location by rendering, then discovering the
+        # written file. Simpler and robust: trigger the export and read back the
+        # path the ROP reports via its evaluated lopoutput after a cook.
+        pass
+
+    # Trigger the export-only stage (writes the thin layer, no husk headless).
+    rop.render(verbose=False)
+
+    # After render(), the thin USD exists at the ROP's resolved output. Discover
+    # it: try the evaluated lopoutput first, then the conventional derived path.
+    candidates = []
+    evaled = lopoutput.eval()
+    if os.path.isabs(evaled):
+        candidates.append(evaled)
+    hip = hou.getenv("HIP") or ""
+    hipname = hou.getenv("HIPNAME") or ""
+    rop_name = rop.name()
+    candidates.append(
+        os.path.join(
+            hip, "ayon", rop_name, "usd", hipname, rop_name, "__render__.usd"
+        )
+    )
+    if not os.path.isabs(evaled):
+        candidates.append(os.path.join(hip, evaled))
+    for cand in candidates:
+        cand = os.path.normpath(cand)
+        if os.path.isfile(cand):
+            return cand.replace("\\", "/")
+    raise RuntimeError(
+        f"husk render path: exported USD not found for {rop_path}. Tried: "
+        f"{candidates}"
+    )
+
+
+def _ods_get_husk_step_template(node: Dict, usd_param_name: str) -> dict[str, Any]:
+    """Build a standalone-husk render step for one render node.
+
+    No stepEnvironments / no houdini-openjd daemon: husk is on PATH from the
+    Conda queue env. Reads the pre-exported USD (a PATH parameter, so Deadline
+    Cloud maps X:\\ -> /mnt/projects on the worker) and renders to the output
+    picture baked in the USD's RenderProduct (so --make-output-path + the product
+    path are used; no -o needed). Linux-only (husk on SMF is Linux).
+    """
+    rop = hou.node(node["rop"])
+    renderer = "BRAY_HdKarma"
+    purpose = "geometry,render"
+    complexity = "veryhigh"
+    rendersettings = "/Render/rendersettings"
+    if rop is not None:
+        if rop.parm("renderer") is not None and rop.parm("renderer").eval():
+            renderer = rop.parm("renderer").eval()
+        if rop.parm("husk_purpose") is not None and rop.parm("husk_purpose").eval():
+            purpose = rop.parm("husk_purpose").eval()
+        if rop.parm("husk_complexity") is not None and rop.parm("husk_complexity").eval():
+            complexity = rop.parm("husk_complexity").eval()
+        if rop.parm("rendersettings") is not None and rop.parm("rendersettings").eval():
+            rendersettings = rop.parm("rendersettings").eval()
+
+    if node["render_strategy"] == RenderStrategy.SEQUENTIAL:
+        parameter_space = {
+            "taskParameterDefinitions": [
+                {
+                    "name": "Frame",
+                    "type": "INT",
+                    "range": "{start}-{end}:{step}".format(**node),
+                }
+            ]
+        }
+    else:
+        parameter_space = {
+            "taskParameterDefinitions": [
+                {
+                    "name": "Frame",
+                    "type": "INT",
+                    "range": "{start}-{end}:{step}".format(**node),
+                }
+            ]
+        }
+
+    # husk reads the RenderSettings + pass and writes to the product path in the
+    # USD. --make-output-path creates missing output dirs. -V 2 keeps logs useful.
+    script = (
+        "set -xeuo pipefail\n"
+        "which husk\n"
+        "husk --version\n"
+        "husk -s '{rendersettings}' --make-output-path "
+        "-f {{{{Task.Param.Frame}}}} -R '{renderer}' "
+        "--purpose '{purpose}' --complexity '{complexity}' -V 2 "
+        "'{{{{Param.{usd_param}}}}}'\n"
+    ).format(
+        rendersettings=rendersettings,
+        renderer=renderer,
+        purpose=purpose,
+        complexity=complexity,
+        usd_param=usd_param_name,
+    )
+
+    step: dict[str, Any] = {
+        "name": node["name"],
+        "parameterSpace": parameter_space,
+        "script": {
+            "actions": {
+                "onRun": {
+                    "command": "bash",
+                    "args": ["{{Task.File.run}}"],
+                },
+            },
+            "embeddedFiles": [
+                {
+                    "name": "run",
+                    "filename": "run-husk.sh",
+                    "type": "TEXT",
+                    "runnable": True,
+                    "data": script,
+                }
+            ],
+        },
+        "hostRequirements": {
+            "attributes": [
+                {"name": "attr.worker.os.family", "anyOf": ["linux"]},
+            ]
+        },
+    }
+
+    if "dependency_names" in node:
+        step["dependencies"] = [{"dependsOn": d} for d in node["dependency_names"]]
+    return step
+# --- end ODS husk-native render path -----------------------------------------
 
 
 def _get_step_template(node: Dict, ignore_input_nodes: bool):
