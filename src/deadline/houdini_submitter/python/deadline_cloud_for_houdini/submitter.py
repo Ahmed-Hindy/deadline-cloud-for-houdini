@@ -661,13 +661,16 @@ def _get_job_template(
     if _ods_use_husk():
         # ODS husk-native path: render a pre-exported USD with standalone husk.
         # No HipFile input (husk never opens the hip). Each render node exports
-        # its thin USD at submit time; declare it as a per-node PATH input so
-        # Deadline Cloud maps X:\ -> /mnt/projects on the worker.
+        # its thin USD at submit time; declare the USD as a per-node IN PATH param
+        # and its output dir as an OUT PATH param so Deadline Cloud maps both
+        # X:\ -> /mnt/projects on the worker.
         for node in rop_steps:
-            usd_path = _ods_export_render_usd(node["rop"])
-            usd_param = "RenderUsdFile_{}".format(
-                re.sub(r"[^A-Za-z0-9_]", "_", node["name"])
+            usd_path, output_dir, output_basename = _ods_export_render_usd(
+                node["rop"]
             )
+            safe = re.sub(r"[^A-Za-z0-9_]", "_", node["name"])
+            usd_param = "RenderUsdFile_{}".format(safe)
+            outdir_param = "OutputDir_{}".format(safe)
             parameter_definitions.append(
                 {
                     "name": usd_param,
@@ -677,7 +680,20 @@ def _get_job_template(
                     "default": usd_path,
                 }
             )
-            steps.append(_ods_get_husk_step_template(node, usd_param))
+            parameter_definitions.append(
+                {
+                    "name": outdir_param,
+                    "type": "PATH",
+                    "objectType": "DIRECTORY",
+                    "dataFlow": "OUT",
+                    "default": output_dir,
+                }
+            )
+            steps.append(
+                _ods_get_husk_step_template(
+                    node, usd_param, outdir_param, output_basename
+                )
+            )
     else:
         parameter_definitions.append(
             {
@@ -788,13 +804,23 @@ def _ods_use_husk() -> bool:
     return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
 
 
-def _ods_export_render_usd(rop_path: str) -> str:
+def _ods_export_render_usd(rop_path: str) -> tuple[str, str, str]:
     """Export the usdrender ROP's thin render USD at submit time.
 
     Calling render() on a Driver/usdrender ROP writes its ``lopoutput`` thin USD
     layer (which references the scene's existing USD on the share — not a flatten)
     and, headless, skips the husk stage. That exported layer is exactly what husk
-    needs. Returns the absolute path to the exported ``__render__.usd``.
+    needs.
+
+    Returns a tuple ``(usd_path, output_dir, output_basename)``:
+      * ``usd_path``       — abs path (fwd slashes) to the exported ``__render__.usd``
+      * ``output_dir``     — abs dir of the RenderProduct's productName (the render
+                             output folder); passed to husk as an OUT PATH param so
+                             Deadline Cloud maps it onto the worker.
+      * ``output_basename``— the productName filename (e.g. ``foo.$F4.exr`` with the
+                             frame digits turned into a husk ``$F<pad>`` token), used
+                             with husk ``-o`` so husk does NOT write to the raw
+                             (unmapped) ``X:\\`` productName baked in the USD.
     """
     rop = hou.node(rop_path)
     if rop is None:
@@ -806,17 +832,6 @@ def _ods_export_render_usd(rop_path: str) -> str:
             f"ROP {rop_path} has no 'lopoutput' parm; husk render path needs a "
             "usdrender ROP."
         )
-
-    # Resolve the absolute export path the ROP would write to. lopoutput often
-    # evaluates to a bare '__render__.usd'; the ROP writes it under a derived
-    # $HIP/ayon/<rop>/usd/<hipname>/<rop>/ dir. Evaluate via the ROP so the real
-    # target is captured, then make it absolute against $HIP when relative.
-    out_path = lopoutput.eval()
-    if not os.path.isabs(out_path):
-        # Reproduce the ROP's derived location by rendering, then discovering the
-        # written file. Simpler and robust: trigger the export and read back the
-        # path the ROP reports via its evaluated lopoutput after a cook.
-        pass
 
     # Trigger the export-only stage (writes the thin layer, no husk headless).
     rop.render(verbose=False)
@@ -837,24 +852,82 @@ def _ods_export_render_usd(rop_path: str) -> str:
     )
     if not os.path.isabs(evaled):
         candidates.append(os.path.join(hip, evaled))
+    usd_path = None
     for cand in candidates:
         cand = os.path.normpath(cand)
         if os.path.isfile(cand):
-            return cand.replace("\\", "/")
-    raise RuntimeError(
-        f"husk render path: exported USD not found for {rop_path}. Tried: "
-        f"{candidates}"
-    )
+            usd_path = cand.replace("\\", "/")
+            break
+    if usd_path is None:
+        raise RuntimeError(
+            f"husk render path: exported USD not found for {rop_path}. Tried: "
+            f"{candidates}"
+        )
+
+    output_dir, output_basename = _ods_render_output_from_usd(usd_path)
+    return usd_path, output_dir, output_basename
 
 
-def _ods_get_husk_step_template(node: Dict, usd_param_name: str) -> dict[str, Any]:
+def _ods_render_output_from_usd(usd_path: str) -> tuple[str, str]:
+    """Read the first RenderProduct productName and split it into (dir, husk pattern).
+
+    The productName is an absolute drive path (e.g. ``X:/.../foo.0002.exr``) that
+    does not resolve on the Linux worker. We split it so the dir becomes an OUT
+    PATH param (Deadline Cloud maps it) and the basename becomes a husk ``-o``
+    pattern with the frame digits replaced by ``$F<pad>`` so husk fills the frame.
+    """
+    from pxr import Usd
+
+    stage = Usd.Stage.Open(usd_path)
+    product_path = ""
+    if stage:
+        products = stage.GetPrimAtPath("/Render/Products")
+        if products and products.IsValid():
+            for child in products.GetChildren():
+                if child.GetTypeName() == "RenderProduct":
+                    attr = child.GetAttribute("productName")
+                    if attr:
+                        val = attr.Get(0)
+                        if val:
+                            product_path = str(val)
+                            break
+    if not product_path:
+        raise RuntimeError(
+            f"husk render path: no RenderProduct productName in {usd_path}"
+        )
+
+    product_path = product_path.replace("\\", "/")
+    output_dir = os.path.dirname(product_path)
+    basename = os.path.basename(product_path)
+    # Turn a resolved frame number (e.g. 'foo.0002.exr') into a husk frame token
+    # 'foo.$F4.exr' so -o renders the correct per-frame filename. Match the last
+    # run of digits before the extension.
+    stem, ext = os.path.splitext(basename)
+    m = re.search(r"(\d+)$", stem)
+    if m:
+        pad = len(m.group(1))
+        stem = stem[: m.start()] + "$F{}".format(pad)
+    pattern = stem + ext
+    return output_dir, pattern
+
+
+def _ods_get_husk_step_template(
+    node: Dict,
+    usd_param_name: str,
+    outdir_param_name: str,
+    output_basename: str,
+) -> dict[str, Any]:
     """Build a standalone-husk render step for one render node.
 
     No stepEnvironments / no houdini-openjd daemon: husk is on PATH from the
-    Conda queue env. Reads the pre-exported USD (a PATH parameter, so Deadline
-    Cloud maps X:\\ -> /mnt/projects on the worker) and renders to the output
-    picture baked in the USD's RenderProduct (so --make-output-path + the product
-    path are used; no -o needed). Linux-only (husk on SMF is Linux).
+    Conda queue env. Reads the pre-exported USD (``usd_param_name``, a PATH input,
+    so Deadline Cloud maps X:\\ -> /mnt/projects on the worker) and renders with an
+    explicit ``-o <OutputDir>/<basename>``. The explicit ``-o`` is essential: the
+    USD's RenderProduct productName is an absolute ``X:\\`` path that does NOT
+    resolve on the Linux worker (husk would write to a throwaway ``./X:\\`` dir),
+    so we override it with ``outdir_param_name`` (an OUT PATH param DC maps to
+    ``/mnt/projects``) plus the frame-tokenised basename. Linux-only (husk on SMF
+    is Linux).
     """
     rop = hou.node(node["rop"])
     renderer = "BRAY_HdKarma"
@@ -892,21 +965,26 @@ def _ods_get_husk_step_template(node: Dict, usd_param_name: str) -> dict[str, An
             ]
         }
 
-    # husk reads the RenderSettings + pass and writes to the product path in the
-    # USD. --make-output-path creates missing output dirs. -V 2 keeps logs useful.
+    # husk reads the RenderSettings and writes to an explicit -o path under the
+    # mapped OutputDir (NOT the USD's unmapped X:\ productName).
+    # --make-output-path creates missing output dirs. -V 2 keeps logs useful.
     script = (
         "set -xeuo pipefail\n"
         "which husk\n"
-        "husk --version\n"
+        # husk --version exits 1 even on success; keep it informational only.
+        "husk --version || true\n"
         "husk -s '{rendersettings}' --make-output-path "
         "-f {{{{Task.Param.Frame}}}} -R '{renderer}' "
         "--purpose '{purpose}' --complexity '{complexity}' -V 2 "
+        "-o '{{{{Param.{outdir_param}}}}}/{output_basename}' "
         "'{{{{Param.{usd_param}}}}}'\n"
     ).format(
         rendersettings=rendersettings,
         renderer=renderer,
         purpose=purpose,
         complexity=complexity,
+        outdir_param=outdir_param_name,
+        output_basename=output_basename,
         usd_param=usd_param_name,
     )
 
