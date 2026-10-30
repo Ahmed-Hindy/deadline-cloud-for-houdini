@@ -253,9 +253,15 @@ class HoudiniSubmitter(BaseSubmitter):
                 "value": houdini_settings.max_failed_tasks_count,
             },
             {"name": "deadline:maxRetriesPerTask", "value": houdini_settings.max_retries_per_task},
-            {"name": "HipFile", "value": _get_hip_file()},
             *get_queue_parameter_values_as_openjd(rop),
         ]
+        if _ods_use_husk():
+            # Husk mode: no HipFile (husk never opens the hip). Emit the exported
+            # USD / output-dir as absolute parameter VALUES (not template defaults)
+            # from the cache the template build populated for this ROP.
+            parameter_values.extend(_ODS_HUSK_PARAM_VALUES.get(rop.path(), []))
+        else:
+            parameter_values.append({"name": "HipFile", "value": _get_hip_file()})
         if houdini_settings.include_adaptor_wheels and os.path.exists(
             houdini_settings.adaptor_wheels
         ):
@@ -664,6 +670,13 @@ def _get_job_template(
         # its thin USD at submit time; declare the USD as a per-node IN PATH param
         # and its output dir as an OUT PATH param so Deadline Cloud maps both
         # X:\ -> /mnt/projects on the worker.
+        #
+        # PATH defaults must be RELATIVE (Deadline Cloud rejects an absolute PATH
+        # default as "must resolve within the Job Bundle"). So the param defs carry
+        # NO default; the absolute exported-USD / output-dir are emitted as
+        # parameter *values* by get_parameter_values, via the cache we populate
+        # here keyed by this ROP's path.
+        husk_values: list[dict[str, Any]] = []
         for node in rop_steps:
             usd_path, output_dir, output_basename = _ods_export_render_usd(
                 node["rop"]
@@ -677,7 +690,6 @@ def _get_job_template(
                     "type": "PATH",
                     "objectType": "FILE",
                     "dataFlow": "IN",
-                    "default": usd_path,
                 }
             )
             parameter_definitions.append(
@@ -686,14 +698,16 @@ def _get_job_template(
                     "type": "PATH",
                     "objectType": "DIRECTORY",
                     "dataFlow": "OUT",
-                    "default": output_dir,
                 }
             )
+            husk_values.append({"name": usd_param, "value": usd_path})
+            husk_values.append({"name": outdir_param, "value": output_dir})
             steps.append(
                 _ods_get_husk_step_template(
                     node, usd_param, outdir_param, output_basename
                 )
             )
+        _ODS_HUSK_PARAM_VALUES[rop.path()] = husk_values
     else:
         parameter_definitions.append(
             {
@@ -798,6 +812,14 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
 # PATH from the Conda queue env's Houdini package. Mirrors the AWS
 # deadline-cloud-samples houdini_husk_usd_render bundle.
 _ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
+
+# Husk-mode parameter VALUES (absolute exported-USD / output-dir paths) computed
+# while building the job template, keyed by the ROP's path. get_parameter_values
+# reads these back so the absolute paths are emitted as parameter *values* rather
+# than template *defaults* (Deadline Cloud rejects absolute PATH defaults). The
+# template build (get_job_template) always runs before get_parameter_values for
+# the same ROP, so the cache is populated in time.
+_ODS_HUSK_PARAM_VALUES: Dict[str, list[dict[str, Any]]] = {}
 
 
 def _ods_use_husk() -> bool:
