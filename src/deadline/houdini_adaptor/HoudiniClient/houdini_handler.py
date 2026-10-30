@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os as os
 from typing import TYPE_CHECKING, Any, Callable, Dict, List
 
@@ -116,6 +117,149 @@ class HoudiniHandler:
                     # parm rather than aborting path mapping for the rest of the scene.
                     print(f"Skipping LOP parm {parm.path()}: {exc}")
 
+    def _ods_pathmap_rules(self) -> list[tuple[str, str]]:
+        """
+        Parse HOUDINI_PATHMAP into (source, destination) prefix pairs, normalized
+        to forward slashes. Used as a fallback when `pathmap -t` does not rewrite a
+        path (e.g. an absolute Windows output path such as ``X:/...`` that husk will
+        later write verbatim on the Linux worker).
+        """
+        raw = os.environ.get("HOUDINI_PATHMAP")
+        if not raw:
+            return []
+        try:
+            mapping = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        rules: list[tuple[str, str]] = []
+        for src, dst in mapping.items():
+            if not src or not dst:
+                continue
+            rules.append((str(src).replace("\\", "/"), str(dst).replace("\\", "/")))
+        # Longest source first so the most specific prefix wins.
+        rules.sort(key=lambda r: len(r[0]), reverse=True)
+        return rules
+
+    def _ods_map_output_path(self, path: str) -> str:
+        """
+        Map a render OUTPUT path to the worker filesystem.
+
+        The DC Houdini adaptor already maps INPUT scene/LOP references, but the
+        render output picture (the Karma RenderProduct ``productName`` / the ROP
+        output image) is left as the authored absolute drive path (e.g. ``X:/...``).
+        On a Linux worker that path is *relative*, so husk writes the frame to a
+        throwaway ``./X:/...`` dir under the session and it is discarded at cleanup.
+
+        This maps the path the same way inputs are mapped: try Houdini's own
+        ``pathmap`` first, then fall back to a direct, separator-tolerant prefix
+        replacement from HOUDINI_PATHMAP (handles the ``X:\\`` rule vs ``X:/`` path
+        mismatch that defeats a naive prefix test).
+        """
+        if not path:
+            return path
+
+        # 1) Let Houdini try first.
+        try:
+            mapped, err = hou.hscript(f"pathmap -t '{path}' -c")
+            mapped = mapped.strip()
+            if not err and mapped and mapped != path:
+                return mapped
+        except hou.Error:
+            pass
+
+        # 2) Fallback: separator-tolerant prefix replacement from HOUDINI_PATHMAP.
+        norm = path.replace("\\", "/")
+        for src, dst in self._ods_pathmap_rules():
+            src_trim = src.rstrip("/")
+            if norm == src_trim or norm.startswith(src_trim + "/"):
+                dst_trim = dst.rstrip("/")
+                remainder = norm[len(src_trim):]
+                result = dst_trim + remainder
+                # Collapse any accidental double slash from a trailing-slash rule.
+                while "//" in result[1:]:
+                    result = result[0] + result[1:].replace("//", "/")
+                return result
+        return path
+
+    def _remap_render_output_paths(self) -> None:
+        """
+        Map the render node's OUTPUT path parms onto the worker filesystem.
+
+        Companion to ``_remap_lop_file_paths`` (which handles INPUT references).
+        Without this, the Karma RenderProduct ``productName`` / the usdrender ROP
+        output image keeps its authored ``X:/...`` drive path and the rendered EXR
+        never lands on the shared project mount.
+
+        Targets, per render-node type:
+          * usdrender ROP: ``outputimage`` (output image override)
+          * the Karma Render Settings LOP(s) feeding the ROP's ``loppath``:
+            ``picture`` (output image), ``dcmfilename``, and ``productName`` when it
+            holds a real output path.
+        Internal USD scratch paths (``lopoutput``, e.g. ``__render__.usd``) are left
+        alone -- they are session-local and must not be moved to the share.
+        """
+        if not os.environ.get("HOUDINI_PATHMAP") or not self.node:
+            return
+
+        output_parm_names = ("outputimage", "vm_picture", "soho_diskfile")
+        self._ods_remap_node_output_parms(self.node, output_parm_names)
+
+        # Follow the usdrender ROP's loppath to the render/karma settings LOPs and
+        # remap their output picture parms too (that is where productName comes from).
+        try:
+            loppath_parm = self.node.parm("loppath")
+        except hou.Error:
+            loppath_parm = None
+        if loppath_parm:
+            lop = loppath_parm.evalAsNode()
+            if lop:
+                stage_parent = lop.parent()
+                lop_output_parms = ("picture", "dcmfilename", "productName")
+                # Remap the picture/product parms on every LOP under the same stage
+                # network -- the render settings node may be upstream of loppath.
+                nodes_to_check = {lop}
+                if stage_parent:
+                    nodes_to_check.update(
+                        stage_parent.recursiveGlob("*", filter=hou.nodeTypeFilter.Lop)
+                    )
+                for n in nodes_to_check:
+                    self._ods_remap_node_output_parms(n, lop_output_parms)
+
+    def _ods_remap_node_output_parms(self, node: Node, parm_names: tuple[str, ...]) -> None:
+        """Remap the named string output parms on ``node`` through the path map."""
+        for name in parm_names:
+            try:
+                parm = node.parm(name)
+            except hou.Error:
+                parm = None
+            if not parm:
+                continue
+            try:
+                template = parm.parmTemplate()
+                if template.type() != hou.parmTemplateType.String:
+                    continue
+                # Evaluate so that $HIP/$OS/etc. are resolved to a concrete path
+                # (which may still be an unmapped X:/...), then map that.
+                try:
+                    original = parm.evalAsString()
+                except hou.Error:
+                    continue
+                if not original:
+                    continue
+                # Only touch productName when it is a real image output path, not a
+                # checkpoint/resume file that lives beside it.
+                if name == "productName" and original.lower().endswith(".checkpoint"):
+                    continue
+                mapped = self._ods_map_output_path(original)
+                if mapped and mapped != original:
+                    parm.set(mapped)
+                    print(f"Remapped output parm {parm.path()}: {original} -> {mapped}")
+            except hou.OperationFailed:
+                # Keyframed/expression parm; do not clobber the channel.
+                print(f"Skipping output parm {node.path()}/{name} (keyframed/expression)")
+            except hou.Error as exc:
+                print(f"Skipping output parm {node.path()}/{name}: {exc}")
+
     def set_node_settings(self, node):
         # this is a place holder function
         # TODO remove after common node library implemented
@@ -202,6 +346,12 @@ class HoudiniHandler:
                 raise ValueError(f"WEDGENUM out of range: {wedgenum}")
 
         self.node.parm("trange").set(1)
+
+        # Map the render OUTPUT path(s) onto the worker filesystem. Inputs are
+        # already mapped (set_scene_file -> _remap_lop_file_paths); without this the
+        # output picture keeps its authored X:/... drive path and husk writes the
+        # frame to a throwaway ./X:/... dir on Linux that is discarded at cleanup.
+        self._remap_render_output_paths()
 
         interleave = hou.renderMethod.RopByRop
 
