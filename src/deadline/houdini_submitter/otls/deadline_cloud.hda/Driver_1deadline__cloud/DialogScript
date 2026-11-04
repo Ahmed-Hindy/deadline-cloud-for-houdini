@@ -672,6 +672,13 @@
             help    "Split the ROP graph into separate rendering steps for easier monitoring and debugging."
         }
         parm {
+            name    "ods_use_husk"
+            label   "Render usdrender with husk (ODS)"
+            type    toggle
+            default { "0" }
+            help    "ODS: render usdrender ROPs with standalone husk on a pre-exported USD instead of the houdini-openjd (hython) adaptor. Avoids the full Houdini Engine licence and the Driver/usdrender node.render() no-op. Honoured by both the native submit and the AYON publish. Overrides the legacy ODS_HOUDINI_USE_HUSK environment variable when present."
+        }
+        parm {
             name    "include_adaptor_wheels"
             label   "Include Adaptor Wheels"
             type    toggle

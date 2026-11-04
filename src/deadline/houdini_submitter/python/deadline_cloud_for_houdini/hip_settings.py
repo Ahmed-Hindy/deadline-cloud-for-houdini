@@ -32,6 +32,7 @@ class HoudiniSubmitterUISettings:
     hip_file: str = field(default="", metadata={"sticky": True})
     render_strategy: str = field(default=RenderStrategy.SEQUENTIAL.value, metadata={"sticky": True})
     separate_steps: bool = field(default=False, metadata={"sticky": True})
+    ods_use_husk: bool = field(default=False, metadata={"sticky": True})
     auto_unlock_rops: bool = field(default=False, metadata={"sticky": True})
     auto_parse_hip: bool = field(default=True, metadata={"sticky": True})
     auto_save_hip: bool = field(default=True, metadata={"sticky": True})

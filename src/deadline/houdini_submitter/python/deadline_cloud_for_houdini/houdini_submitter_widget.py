@@ -30,6 +30,10 @@ class SceneSettingsWidget(QWidget):
         layout.addWidget(self.separate_step_check, qt_pos_index, 0)
 
         qt_pos_index += 1
+        self.ods_use_husk_check = QCheckBox("Render usdrender with husk (ODS)", self)
+        layout.addWidget(self.ods_use_husk_check, qt_pos_index, 0)
+
+        qt_pos_index += 1
         self.include_adaptor_wheels_check = QCheckBox("Include Adaptor Wheels", self)
         layout.addWidget(self.include_adaptor_wheels_check, qt_pos_index, 0)
 
@@ -65,6 +69,7 @@ class SceneSettingsWidget(QWidget):
         """
 
         self.separate_step_check.setChecked(settings.separate_steps)
+        self.ods_use_husk_check.setChecked(settings.ods_use_husk)
         self.include_adaptor_wheels_check.setChecked(settings.include_adaptor_wheels)
         self.adaptor_wheels_directory_picker.setEnabled(settings.include_adaptor_wheels)
         if settings.adaptor_wheels_dir:
@@ -86,6 +91,7 @@ class SceneSettingsWidget(QWidget):
         """
 
         settings.separate_steps = self.separate_step_check.isChecked()
+        settings.ods_use_husk = self.ods_use_husk_check.isChecked()
         settings.include_adaptor_wheels = self.include_adaptor_wheels_check.isChecked()
         if settings.include_adaptor_wheels:
             settings.adaptor_wheels_dir = self.adaptor_wheels_directory_picker.getText()

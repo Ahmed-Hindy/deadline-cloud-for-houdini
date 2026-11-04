@@ -6,6 +6,7 @@ import copy
 import os
 import re
 import sys
+import time
 import yaml
 import json
 import traceback
@@ -255,7 +256,7 @@ class HoudiniSubmitter(BaseSubmitter):
             {"name": "deadline:maxRetriesPerTask", "value": houdini_settings.max_retries_per_task},
             *get_queue_parameter_values_as_openjd(rop),
         ]
-        if _ods_use_husk():
+        if _ods_use_husk(rop):
             # Husk mode: no HipFile (husk never opens the hip). Emit the exported
             # USD / output-dir as absolute parameter VALUES (not template defaults)
             # from the cache the template build populated for this ROP.
@@ -550,6 +551,8 @@ def read_ui_settings_from_node(node: hou.Node) -> HoudiniSubmitterUISettings:
     settings.max_retries_per_task = node.parm("task_retry_limit").eval()
 
     settings.separate_steps = bool(node.parm("separate_steps").eval())
+    if node.parm("ods_use_husk"):
+        settings.ods_use_husk = bool(node.parm("ods_use_husk").eval())
     settings.auto_unlock_rops = bool(node.parm("auto_unlock_rops").eval())
     settings.auto_parse_hip = bool(node.parm("auto_parse_hip").eval())
     settings.auto_save_hip = bool(node.parm("auto_save_hip").eval())
@@ -581,6 +584,8 @@ def write_ui_settings_to_node(node: hou.Node, settings: HoudiniSubmitterUISettin
     node.parm("task_retry_limit").set(settings.max_retries_per_task)
 
     node.parm("separate_steps").set(int(settings.separate_steps))
+    if node.parm("ods_use_husk"):
+        node.parm("ods_use_husk").set(int(settings.ods_use_husk))
     node.parm("auto_unlock_rops").set(int(settings.auto_unlock_rops))
     node.parm("auto_parse_hip").set(int(settings.auto_parse_hip))
     node.parm("auto_save_hip").set(int(settings.auto_save_hip))
@@ -664,7 +669,7 @@ def _get_job_template(
         else []
     )
     steps: list[dict[str, Any]] = []
-    if _ods_use_husk():
+    if _ods_use_husk(rop):
         # ODS husk-native path: render a pre-exported USD with standalone husk.
         # No HipFile input (husk never opens the hip). Each render node exports
         # its thin USD at submit time; declare the USD as a per-node IN PATH param
@@ -804,14 +809,21 @@ def _apply_adaptor_wheels_override(job_template: dict[str, Any], enabled: bool) 
 
 
 # --- ODS: husk-native render path -------------------------------------------
-# When ODS_HOUDINI_USE_HUSK is set, render usdrender ROPs with standalone husk on
-# a pre-exported USD instead of the houdini-openjd adaptor (which cooks the scene
-# in hython and, for a Driver/usdrender ROP, only exports the USD and never runs
-# husk headless). The USD is exported at submit time (_ods_export_render_usd) and
-# declared as a PATH input so Deadline Cloud maps it onto the worker. husk is on
-# PATH from the Conda queue env's Houdini package. Mirrors the AWS
-# deadline-cloud-samples houdini_husk_usd_render bundle.
+# When the DC ROP's 'Render usdrender with husk (ODS)' toggle (ods_use_husk) is
+# on, render usdrender ROPs with standalone husk on a pre-exported USD instead of
+# the houdini-openjd adaptor (which cooks the scene in hython and, for a
+# Driver/usdrender ROP, only exports the USD and never runs husk headless). The
+# USD is exported at submit time (_ods_export_render_usd) and declared as a PATH
+# input so Deadline Cloud maps it onto the worker. husk is on PATH from the Conda
+# queue env's Houdini package. Mirrors the AWS deadline-cloud-samples
+# houdini_husk_usd_render bundle.
+#
+# The toggle is a ROP parameter (not a Qt-dialog checkbox) so BOTH the native GUI
+# submit and the AYON bridge honour it: both resolve the same ROP node. The legacy
+# ODS_HOUDINI_USE_HUSK environment variable is still honoured as a fallback for
+# back-compat (e.g. headless bundles built before the parm existed).
 _ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
+_ODS_USE_HUSK_PARM = "ods_use_husk"
 
 # Husk-mode parameter VALUES (absolute exported-USD / output-dir paths) computed
 # while building the job template, keyed by the ROP's path. get_parameter_values
@@ -822,7 +834,20 @@ _ODS_USE_HUSK_ENV = "ODS_HOUDINI_USE_HUSK"
 _ODS_HUSK_PARAM_VALUES: Dict[str, list[dict[str, Any]]] = {}
 
 
-def _ods_use_husk() -> bool:
+def _ods_use_husk(rop: Optional["hou.Node"] = None) -> bool:
+    """Whether to use the husk-native render path for this ROP.
+
+    Reads the ROP's ``ods_use_husk`` toggle parameter when available (the
+    submitter UI option, honoured by both the GUI submit and the AYON bridge
+    since both resolve the same node). Falls back to the legacy
+    ``ODS_HOUDINI_USE_HUSK`` environment variable when the ROP is not given or
+    the parm is absent (older HDAs / headless callers), so pre-existing setups
+    keep working.
+    """
+    if rop is not None:
+        parm = rop.parm(_ODS_USE_HUSK_PARM)
+        if parm is not None:
+            return bool(parm.eval())
     return str2bool(os.environ.get(_ODS_USE_HUSK_ENV, "false"))
 
 
@@ -855,35 +880,138 @@ def _ods_export_render_usd(rop_path: str) -> tuple[str, str, str]:
             "usdrender ROP."
         )
 
-    # Trigger the export-only stage (writes the thin layer, no husk headless).
-    rop.render(verbose=False)
-
-    # After render(), the thin USD exists at the ROP's resolved output. Discover
-    # it: try the evaluated lopoutput first, then the conventional derived path.
-    candidates = []
-    evaled = lopoutput.eval()
-    if os.path.isabs(evaled):
-        candidates.append(evaled)
     hip = hou.getenv("HIP") or ""
-    hipname = hou.getenv("HIPNAME") or ""
-    rop_name = rop.name()
-    candidates.append(
-        os.path.join(
-            hip, "ayon", rop_name, "usd", hipname, rop_name, "__render__.usd"
+
+    # Where render() writes the thin __render__.usd depends on the ROP type:
+    #   * Driver/usdrender writes under the ayon/<rop>/usd/... HIP tree;
+    #   * a LOP usdrender_rop routes the export through its "Save to Directory" output
+    #     processor to $HOUDINI_TEMP_DIR/usd_renders/$RENDERID/ (unique local temp, off
+    #     the share and un-mappable by Deadline Cloud).
+    # Relying on the side-effect path is therefore unreliable and, for the LOP case,
+    # off-share. Instead force a DETERMINISTIC on-share export location under $HIP (so
+    # Deadline Cloud maps X:\ -> /mnt/projects) and put the ROP in husk_debug mode so
+    # render() EXPORTS the thin USD and prints the husk command WITHOUT actually
+    # rendering. All touched parms are restored afterwards so the artist's node is
+    # left exactly as it was.
+    if not hip:
+        raise RuntimeError(
+            "husk render path: $HIP is not set; cannot pick a mappable export "
+            f"location for {rop_path}."
         )
-    )
-    if not os.path.isabs(evaled):
-        candidates.append(os.path.join(hip, evaled))
+    # Export to a UNIQUE per-submit subdir under $HIP. Unique because the shared
+    # project store (FSx/OpenZFS) can make a previously-written __render__.usd
+    # un-overwritable from the submitting workstation (NFS ownership maps the first
+    # writer; a later atomic save-then-rename is then "Access denied"). A fresh
+    # subdir per submit avoids colliding with — or trying to delete — a prior export,
+    # while staying on-share so Deadline Cloud maps X:\ -> /mnt/projects.
+    export_dir = os.path.join(
+        hip, "ayon", "_ods_husk_export", rop.name(), str(int(time.time() * 1000))
+    ).replace("\\", "/")
+    export_usd = export_dir + "/__render__.usd"
+    os.makedirs(export_dir, exist_ok=True)
+
+    # Parms we flip for a clean, deterministic, render-free export. Not every parm
+    # exists on every usdrender variant, so each is guarded.
+    savedir = rop.parm("savetodirectory_directory")
+    savedir_enable = rop.parm("enableoutputprocessor_savetodirectory")
+    husk_debug = rop.parm("husk_debug")
+    rendercommand = rop.parm("rendercommand")
+    lopoutput_parm = lopoutput
+
+    def _remember(parm):
+        # Remember both the raw value (preserves expressions on string parms) and the
+        # evaluated value (for toggles/ints whose rawValue() is "on"/"off" and cannot
+        # be passed back to set()). Restore tries raw first, then the numeric eval.
+        if parm is None:
+            return None
+        try:
+            raw = parm.rawValue()
+        except Exception:
+            raw = None
+        try:
+            ev = parm.eval()
+        except Exception:
+            ev = None
+        return (parm, raw, ev)
+
+    def _restore(entry):
+        if entry is None:
+            return
+        parm, raw, ev = entry
+        try:
+            parm.set(raw)
+            return
+        except Exception:
+            pass
+        try:
+            parm.set(ev)
+        except Exception:
+            pass
+
+    saved = []  # list of (parm, raw, eval) remembered BEFORE mutation
+    try:
+        if savedir is not None:
+            saved.append(_remember(savedir))
+            savedir.set(export_dir)
+            if savedir_enable is not None:
+                saved.append(_remember(savedir_enable))
+                savedir_enable.set(1)
+        else:
+            # Older/alternate ROPs with no savetodirectory: steer lopoutput directly.
+            saved.append(_remember(lopoutput_parm))
+            lopoutput_parm.set(export_usd)
+        if husk_debug is not None:
+            saved.append(_remember(husk_debug))
+            husk_debug.set(0)
+        # Blank the husk render command so the render stage CANNOT launch husk. The
+        # usdrender ROP still writes its thin, self-contained __render__.usd during the
+        # export pre-pass (references on-share assets, ~KB, no in-memory anon layers);
+        # then the now-empty render command fails to launch and raises OperationFailed,
+        # which we swallow. This avoids the bug where rop.render() with husk_debug=1 ran
+        # a FULL local husk render on the submitting workstation (CPU pegged, GUI hung).
+        if rendercommand is not None:
+            saved.append(_remember(rendercommand))
+            rendercommand.set("")
+        try:
+            rop.render(verbose=False)
+        except hou.OperationFailed:
+            # Expected when rendercommand was blanked: the USD export already ran; only
+            # the (empty) husk launch failed. Verified below by checking the file exists.
+            pass
+    finally:
+        for entry in saved:
+            _restore(entry)
+
     usd_path = None
-    for cand in candidates:
-        cand = os.path.normpath(cand)
-        if os.path.isfile(cand):
-            usd_path = cand.replace("\\", "/")
-            break
+    if os.path.isfile(export_usd):
+        usd_path = os.path.normpath(export_usd).replace("\\", "/")
+
+    # Fallback: the pre-fix discovery (evaluated lopoutput / Driver naming convention),
+    # in case a ROP variant ignored savetodirectory.
+    if usd_path is None:
+        candidates = []
+        evaled = lopoutput.eval()
+        if os.path.isabs(evaled):
+            candidates.append(evaled)
+        hipname = hou.getenv("HIPNAME") or ""
+        rop_name = rop.name()
+        candidates.append(
+            os.path.join(
+                hip, "ayon", rop_name, "usd", hipname, rop_name, "__render__.usd"
+            )
+        )
+        if not os.path.isabs(evaled):
+            candidates.append(os.path.join(hip, evaled))
+        for cand in candidates:
+            cand = os.path.normpath(cand)
+            if os.path.isfile(cand):
+                usd_path = cand.replace("\\", "/")
+                break
+
     if usd_path is None:
         raise RuntimeError(
-            f"husk render path: exported USD not found for {rop_path}. Tried: "
-            f"{candidates}"
+            f"husk render path: exported USD not found for {rop_path}. Expected "
+            f"{export_usd!r} after a husk_debug export."
         )
 
     output_dir, output_basename = _ods_render_output_from_usd(usd_path)
