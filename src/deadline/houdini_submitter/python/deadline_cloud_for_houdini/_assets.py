@@ -8,6 +8,55 @@ from pxr import Usd, UsdUtils
 
 import hou
 
+
+# --- ODS: UNC -> mapped-drive remap --------------------------------------------
+# Houdini/USD resolve a mapped network drive (e.g. X:) to its UNC target via
+# layer.realPath / os.path.realpath(). The DC asset collector then uploads files
+# under that UNC path, while the render USD still references them by drive letter
+# (X:\...). On the worker, X:\ and the UNC root map to DIFFERENT job-attachment
+# assetroots, so a file uploaded as UNC is not found where the USD looks for it
+# (e.g. a camera sublayer -> "no cameras found"). Remapping UNC back to the drive
+# letter before building the manifest keeps both forms in one assetroot.
+def _ods_build_unc_drive_map() -> dict:
+    """Map UNC target (lowercased, no trailing slash) -> 'X:' for each mapped drive.
+
+    Uses os.path.realpath("<letter>:/") which resolves a mapped network drive to its
+    UNC target (e.g. 'X:/' -> '\\\\host\\fsx\\'). Reliable inside hython, unlike
+    WNetGetConnectionW via ctypes. Only drives whose realpath differs as a UNC are mapped.
+    """
+    mapping = {}
+    for i in range(26):
+        letter = "{}:".format(chr(ord("A") + i))
+        root = letter + "\\"
+        if not os.path.exists(root):
+            continue
+        try:
+            real = os.path.realpath(root)
+        except Exception:
+            continue
+        real_n = real.replace("/", "\\").rstrip("\\")
+        if real_n.startswith("\\\\"):  # a UNC target (mapped network drive)
+            mapping[real_n.lower()] = letter
+    return mapping
+
+_ODS_UNC_DRIVE_MAP = None
+
+def _ods_unc_to_drive(path: str) -> str:
+    """If *path* is under a mapped drive's UNC target, rewrite it to the drive letter."""
+    global _ODS_UNC_DRIVE_MAP
+    if not path:
+        return path
+    norm = path.replace("/", "\\")
+    if not norm.startswith("\\\\"):
+        return path  # not a UNC path
+    if _ODS_UNC_DRIVE_MAP is None:
+        _ODS_UNC_DRIVE_MAP = _ods_build_unc_drive_map()
+    low = norm.lower()
+    for unc, letter in _ODS_UNC_DRIVE_MAP.items():
+        if low == unc or low.startswith(unc + "\\"):
+            return letter + norm[len(unc):]
+    return path
+
 _IGNORE_REF_VALUES = ("opdef:", "oplib:", "temp:", "op:")
 _IGNORE_REF_PARMS = (
     "taskgraphfile",
@@ -240,10 +289,10 @@ def _get_usd_asset_references(usd_file_paths: set[str]) -> tuple[set[str], set[s
 
         for layer in layers:
             if layer.realPath:
-                input_files.add(layer.realPath)
+                input_files.add(_ods_unc_to_drive(layer.realPath))
 
         for asset in assets:
-            input_files.add(os.path.normpath(os.path.join(usd_dir, asset)))
+            input_files.add(_ods_unc_to_drive(os.path.normpath(os.path.join(usd_dir, asset))))
         all_unresolved.extend(unresolved)
         output_directories.update(_get_usd_output_directories(usd_path))
 
@@ -281,7 +330,7 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
                 # Collect USD files for dependency traversal in the next step.
                 # We use the resolved absolute path because UsdUtils.ComputeAllDependencies
                 # needs a real filesystem path, not a Houdini variable like $HIP/scene.usda.
-                usd_files.add(os.path.realpath(path))
+                usd_files.add(_ods_unc_to_drive(os.path.realpath(path)))
 
     # Traverse USD files to find nested dependencies
     if usd_files:
