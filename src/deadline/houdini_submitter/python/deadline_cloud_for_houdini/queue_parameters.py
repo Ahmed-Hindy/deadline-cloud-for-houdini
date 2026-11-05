@@ -327,6 +327,7 @@ def get_queue_parameter_values_as_openjd(
     node: hou.Node,
 ) -> list[dict[str, Any]]:  # pragma: no cover
     result = []
+    conda_enable_entries: list[dict[str, Any]] = []
     spare_parms = node.spareParms()
     for spare_parm in spare_parms:
         # ODS G2 fix (demangle): Houdini mangles a parm name to "xn__..._<hash>" when the logical
@@ -347,7 +348,30 @@ def get_queue_parameter_values_as_openjd(
                 value = _bool_string_from_allowed(
                     parm_template.tags()["allowed_bool_strings"], value
                 )
-            result.append({"name": name, "value": value})
+            entry = {"name": name, "value": value}
+            result.append(entry)
+            # The Conda queue environment's ENABLE parameter is the "Queue Environment: Conda"
+            # group itself (not CondaPackages/Channels/ChannelPriority).
+            if "Conda" in name and name not in (
+                "CondaPackages",
+                "CondaChannels",
+                "ChannelPriority",
+            ):
+                conda_enable_entries.append(entry)
+
+    # ODS G2 fix (auto-enable): this submit dialog renders NO checkbox for the conda-env enable, so a
+    # user can set Conda Packages but has no way to turn the environment on -- it ships disabled and
+    # the packages are ignored (empty-conda -> `which husk` / missing houdini-openjd on the worker).
+    # Specifying packages but not enabling the env is never intended, so when CondaPackages is
+    # non-empty, flip the Conda enable parameter on. Handles both the int folder-enable (0/1) and a
+    # bool-string toggle (false/no/off/0). Clearing the packages field disables this.
+    conda_packages = next(
+        (e["value"] for e in result if e["name"] == "CondaPackages"), None
+    )
+    if isinstance(conda_packages, str) and conda_packages.strip():
+        for entry in conda_enable_entries:
+            if entry["value"] in (0, "0", "false", "no", "off", False):
+                entry["value"] = 1
     return result
 
 
