@@ -4,7 +4,7 @@ import os
 import re
 
 from deadline.client.job_bundle.submission import AssetReferences
-from pxr import Usd, UsdUtils
+from pxr import Ar, Usd, UsdUtils
 
 import hou
 
@@ -299,6 +299,27 @@ def _get_usd_asset_references(usd_file_paths: set[str]) -> tuple[set[str], set[s
     return input_files, output_directories, all_unresolved
 
 
+def _ods_ar_resolve(path: str) -> str:
+    """Resolve *path* through USD's active Ar resolver; return "" if it doesn't resolve.
+
+    A plain ``os.path.isfile`` check misses references whose path carries a
+    *resolver* token rather than a Houdini ``$`` variable -- e.g. a version token
+    like ``asset_<LATEST>.usd`` handled by a custom Ar resolver (plugged in via
+    ``PXR_PLUGINPATH_NAME``). Houdini does NOT expand such tokens in
+    ``parm.evalAsString()``, so the on-disk ``os.path.isfile`` fails and the whole
+    reference (and its nested dependencies) gets silently dropped from the upload.
+    Asking the Ar resolver gives the concrete file the token maps to.
+    """
+    try:
+        resolved = Ar.GetResolver().Resolve(path)
+        resolved_str = str(resolved)
+        if resolved_str and os.path.isfile(resolved_str):
+            return resolved_str
+    except Exception:
+        pass
+    return ""
+
+
 def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
     # collect input filenames
     asset_references: AssetReferences = AssetReferences()
@@ -331,6 +352,18 @@ def _get_scene_asset_references(rop_node: hou.Node) -> AssetReferences:
                 # We use the resolved absolute path because UsdUtils.ComputeAllDependencies
                 # needs a real filesystem path, not a Houdini variable like $HIP/scene.usda.
                 usd_files.add(_ods_unc_to_drive(os.path.realpath(path)))
+        else:
+            # ODS: the on-disk path doesn't exist -- it may carry a custom-resolver
+            # token (e.g. <LATEST>) that only USD's Ar resolver can expand. Without
+            # this, such a top-level reference (and everything it pulls in) is
+            # silently dropped from the job attachments. Resolve via Ar and, if it
+            # lands on a real file, keep the ORIGINAL ref (so the token stays live
+            # for the worker's resolver) and traverse the RESOLVED USD for deps.
+            resolved = _ods_ar_resolve(path)
+            if resolved:
+                asset_references.input_filenames.add(ref)
+                if os.path.splitext(resolved)[1].lower() in _USD_EXTENSIONS:
+                    usd_files.add(_ods_unc_to_drive(os.path.realpath(resolved)))
 
     # Traverse USD files to find nested dependencies
     if usd_files:

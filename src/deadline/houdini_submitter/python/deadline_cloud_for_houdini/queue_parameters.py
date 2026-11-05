@@ -329,8 +329,15 @@ def get_queue_parameter_values_as_openjd(
     result = []
     spare_parms = node.spareParms()
     for spare_parm in spare_parms:
-        if spare_parm.name().startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
-            name = _get_name_without_prefix(spare_parm.name())
+        # ODS G2 fix (demangle): Houdini mangles a parm name to "xn__..._<hash>" when the logical
+        # name isn't a plain identifier. A queue whose parameter name contains spaces/punctuation
+        # (e.g. the conda env's "Queue Environment: Conda" group/enable) is stored mangled and does
+        # NOT start with the plain "queue_env_do_not_use_" prefix, so the stock startswith() check
+        # SKIPS it -> that queue parameter is never carried on the job. Decode the parm name first
+        # so mangled queue parameters round-trip like the plain-named ones (CondaPackages, etc.).
+        decoded_name = hou.text.decode(spare_parm.name())
+        if decoded_name.startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
+            name = decoded_name[len(_QUEUE_ENVIRONMENT_NAME_PREFIX) :]
             parm_template = spare_parm.parmTemplate()
             value = spare_parm.eval()
             if (
@@ -354,11 +361,26 @@ def set_queue_parameter_values_from_openjd(
     handled from the node's base parameters, not the queue-environment spare parms. Parameters
     without a matching spare parm (e.g. when queue parameters haven't been fetched) are ignored.
     """
+    # ODS G2 fix (demangle, write side): map each queue-env spare parm by its DECODED logical
+    # name. node.parm(_get_prefixed_name(name)) fails for a queue parameter whose name contains
+    # spaces/punctuation (e.g. "Queue Environment: Conda"), because Houdini stores that parm under
+    # a mangled "xn__..._<hash>" name -- so a dialog edit to it was silently dropped (the
+    # round-trip half of the empty-conda bug). Looking parms up by decoded name fixes both reads
+    # (get_queue_parameter_values_as_openjd) and writes (here).
+    parm_by_logical_name: dict[str, hou.Parm] = {}
+    for spare_parm in node.spareParms():
+        decoded_name = hou.text.decode(spare_parm.name())
+        if decoded_name.startswith(_QUEUE_ENVIRONMENT_NAME_PREFIX):
+            parm_by_logical_name[decoded_name[len(_QUEUE_ENVIRONMENT_NAME_PREFIX) :]] = spare_parm
+
     for param in queue_parameters:
         name = param.get("name", "")
         if name.startswith("deadline:") or name in ("HipFile", "AdaptorWheels"):
             continue
-        parm = node.parm(_get_prefixed_name(name))
+        parm = parm_by_logical_name.get(name)
+        if parm is None:
+            # Fall back to the plain prefixed name for un-mangled parameters.
+            parm = node.parm(_get_prefixed_name(name))
         if parm is None:
             continue
         value = param.get("value")
