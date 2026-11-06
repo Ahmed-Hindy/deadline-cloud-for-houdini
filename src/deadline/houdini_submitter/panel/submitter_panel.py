@@ -31,6 +31,7 @@ from deadline_cloud_for_houdini.submitter import (
     _pre_gui_hook_confirm_callback,
     _make_create_bundle_callback,
     _install_pre_submission_gate,
+    get_saved_host_requirements,
     read_ui_settings_from_node,
 )
 
@@ -280,6 +281,8 @@ def onCreateInterface():
         ),
         f=Qt.Tool,
         show_host_requirements_tab=True,
+        # ODS: restore the Host requirements tab from the node (persisted on submit/export).
+        host_requirements=get_saved_host_requirements(n),
         use_deadline_cloud_v2_channel=True,
     )
 

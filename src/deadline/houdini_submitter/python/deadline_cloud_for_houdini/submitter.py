@@ -1585,10 +1585,52 @@ def _make_create_bundle_callback(rop_node):
         # before on_submit -- see _install_pre_submission_gate.
         write_ui_settings_to_node(rop_node, settings)
         set_queue_parameter_values_from_openjd(rop_node, queue_parameters)
+        _ods_store_host_requirements(rop_node, host_requirements)
         _create_job_bundle(rop_node, job_bundle_dir, asset_references, host_requirements)
         return None
 
     return _on_create_job_bundle
+
+
+# ODS: node user-data key holding the Host requirements tab's last value (OpenJD
+# "hostRequirements" dict as JSON). User data is saved with the hip, needs no HDA parm, and is
+# ignored by stock code.
+_ODS_HOST_REQUIREMENTS_USERDATA = "ods_host_requirements"
+
+
+def _ods_store_host_requirements(
+    node: hou.Node, host_requirements: Optional[Dict[str, Any]]
+) -> None:
+    """Remember the dialog's host requirements on the node so the next dialog can restore them.
+
+    ``None`` means the tab was left on "Use all available worker hosts", so the stored value is
+    removed and the next dialog opens in that default mode as well.
+    """
+    try:
+        if host_requirements:
+            node.setUserData(_ODS_HOST_REQUIREMENTS_USERDATA, json.dumps(host_requirements))
+        elif node.userData(_ODS_HOST_REQUIREMENTS_USERDATA) is not None:
+            node.destroyUserData(_ODS_HOST_REQUIREMENTS_USERDATA)
+    except Exception as exc:  # never block a submit over this
+        print(f"ODS: could not store host requirements on {node.path()}: {exc}")
+
+
+def get_saved_host_requirements(node: hou.Node):
+    """Return the host requirements stored on *node* as a dialog ``HostRequirements``, or None.
+
+    Used to seed ``SubmitJobToDeadlineDialog(host_requirements=...)`` so the Host requirements tab
+    keeps its values across dialog opens, hip saves and Houdini restarts.
+    """
+    raw = node.userData(_ODS_HOST_REQUIREMENTS_USERDATA)
+    if not raw:
+        return None
+    try:
+        from deadline.client.ui.dataclasses import HostRequirements
+
+        return HostRequirements.from_dict(json.loads(raw))
+    except Exception as exc:  # bad/old data or an older client without from_dict
+        print(f"ODS: ignoring stored host requirements on {node.path()}: {exc}")
+        return None
 
 
 def _install_pre_submission_gate(dialog, node) -> None:
@@ -1715,6 +1757,8 @@ def submit_callback(kwargs):
             ),
             f=Qt.Tool,
             show_host_requirements_tab=True,
+            # ODS: restore the Host requirements tab from the node (persisted on submit/export).
+            host_requirements=get_saved_host_requirements(node),
             use_deadline_cloud_v2_channel=True,
             parent=hou.qt.mainWindow(),
         )
