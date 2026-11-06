@@ -25,8 +25,7 @@ from deadline_cloud_for_houdini._assets import _get_scene_asset_references
 from deadline_cloud_for_houdini.constants import FrameRange
 from deadline_cloud_for_houdini.houdini_submitter_widget import SceneSettingsWidget
 from deadline_cloud_for_houdini.queue_parameters import (
-    get_default_conda_packages,
-    get_default_rez_packages,
+    get_shared_parameter_values_for_dialog,
 )
 from deadline_cloud_for_houdini.submitter import (
     _pre_gui_hook_confirm_callback,
@@ -234,10 +233,8 @@ def onCreateInterface():
     # Seed the shared queue-parameter values with Conda/Rez packages pinned to the running
     # Houdini + adaptor version. The shared dialog applies these as overrides on top of the
     # queue's own (non-version-pinned) defaults. Pre-GUI hooks below can still override them.
-    shared_parameter_values: dict = {
-        "CondaPackages": get_default_conda_packages(),
-        "RezPackages": get_default_rez_packages(),
-    }
+    # ODS G6: seed from the node's saved queue parameters, defaults only where unset.
+    shared_parameter_values: dict = get_shared_parameter_values_for_dialog(n)
 
     # Run pre-GUI hooks so studios can pre-populate dialog fields before it opens. Houdini has no
     # on-disk job bundle at this point, so hooks are sourced from DEADLINE_HOOKS_DIR only

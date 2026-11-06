@@ -375,6 +375,33 @@ def get_queue_parameter_values_as_openjd(
     return result
 
 
+def get_shared_parameter_values_for_dialog(node: hou.Node) -> dict[str, Any]:  # pragma: no cover
+    """Initial shared (queue) parameter values for the submit dialog.
+
+    ODS G6 fix. The dialog used to be seeded with the version-pinned defaults only
+    (``CondaPackages=houdini=21.0.* houdini-openjd=0.7.*``). On Submit the dialog values are written
+    back onto the node, so every open overwrote whatever the artist had entered or saved. Seed the
+    dialog from the node's own queue-parameter values instead, and use the defaults only for the
+    parameters the node has no value for.
+
+    Only non-empty string values are taken from the node: numeric/bool entries (for example the
+    Conda enable toggle) are not shown as text fields, and an empty string means "not set".
+    """
+    values: dict[str, Any] = {
+        "CondaPackages": get_default_conda_packages(),
+        "RezPackages": get_default_rez_packages(),
+    }
+    try:
+        for entry in get_queue_parameter_values_as_openjd(node):
+            value = entry.get("value")
+            if isinstance(value, str) and value.strip():
+                values[entry["name"]] = value
+    except Exception:
+        # Never block opening the dialog: fall back to the plain defaults.
+        pass
+    return values
+
+
 def set_queue_parameter_values_from_openjd(
     node: hou.Node, queue_parameters: list[dict[str, Any]]
 ) -> None:  # pragma: no cover

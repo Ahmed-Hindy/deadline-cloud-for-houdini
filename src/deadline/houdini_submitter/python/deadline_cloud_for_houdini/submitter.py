@@ -28,8 +28,7 @@ from .queue_parameters import (
     update_queue_parameters,
     get_queue_parameter_values_as_openjd,
     set_queue_parameter_values_from_openjd,
-    get_default_conda_packages,
-    get_default_rez_packages,
+    get_shared_parameter_values_for_dialog,
 )
 from ._assets import (
     _get_hip_file,
@@ -1689,10 +1688,8 @@ def submit_callback(kwargs):
 
         ui_settings = read_ui_settings_from_node(node)
 
-        shared_parameter_values: dict = {
-            "CondaPackages": get_default_conda_packages(),
-            "RezPackages": get_default_rez_packages(),
-        }
+        # ODS G6: seed from the node's saved queue parameters, defaults only where unset.
+        shared_parameter_values: dict = get_shared_parameter_values_for_dialog(node)
 
         # Lazy import: keep deadline-cloud's Qt/PySide UI out of the module-import path so
         # headless hython (e.g. integ tests importing _create_job_bundle) does not pull in Qt.
