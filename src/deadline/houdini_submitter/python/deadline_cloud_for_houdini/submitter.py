@@ -35,6 +35,7 @@ from ._assets import (
     _get_hip_file,
     _get_evaluated_asset_references,
     _get_scene_asset_references,
+    _get_usd_asset_references,
     _parse_files,
 )
 
@@ -1279,6 +1280,44 @@ def _get_step_template(node: Dict, ignore_input_nodes: bool):
     return step
 
 
+def _ods_add_husk_export_dependencies(
+    rop_node: hou.Node,
+    parameter_values: list[dict[str, Any]],
+    asset_references: AssetReferences,
+) -> None:
+    """Add everything the exported husk USD depends on to *asset_references*.
+
+    Finds the exported ``__render__.usd`` among the husk parameter values, walks its
+    dependencies through USD (so a custom Ar resolver expands tokens like ``<LATEST>``),
+    and adds the resolved layers/assets as input files. Unresolved paths are printed
+    rather than raised, so a partial scan never blocks the submit.
+    """
+    usd_paths = [
+        p["value"]
+        for p in parameter_values
+        if str(p.get("name", "")).startswith("RenderUsdFile_")
+        and str(p.get("value", "")).lower().endswith(_ODS_USD_EXTS)
+    ]
+    for usd_path in usd_paths:
+        if not os.path.isfile(usd_path):
+            continue
+        inputs, _outputs, unresolved = _get_usd_asset_references({usd_path})
+        # The export itself is already attached via its PATH parameter; keep the
+        # rest. Only real files are kept so the attachment upload cannot fail.
+        for path in inputs:
+            if os.path.isfile(path):
+                asset_references.input_filenames.add(path)
+        print(
+            f"ODS husk export deps for {usd_path}: {len(inputs)} found, "
+            f"{len(unresolved)} unresolved"
+        )
+        for p in unresolved:
+            print(f"  unresolved: {p}")
+
+
+_ODS_USD_EXTS = (".usd", ".usda", ".usdc", ".usdz")
+
+
 def _create_job_bundle(
     rop_node: hou.Node,
     job_bundle_dir: str,
@@ -1298,6 +1337,14 @@ def _create_job_bundle(
     settings = submitter.get_settings(scan_assets=False)
     job_template = submitter.get_job_template(settings, host_requirements)
     parameter_values = submitter.get_parameter_values(settings, [])
+
+    # ODS: in husk mode the job renders the exported __render__.usd, which was
+    # generated just now (during get_job_template) and so was never seen by the
+    # dialog's earlier scene scan. Its nested references (resolver-token layers such
+    # as <LATEST>, textures) must be traversed with the Ar resolver active and added
+    # to the attachments, or the worker gets a black frame.
+    if _ods_use_husk(rop_node):
+        _ods_add_husk_export_dependencies(rop_node, parameter_values, asset_references)
 
     job_bundle_path = Path(job_bundle_dir)
     with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
